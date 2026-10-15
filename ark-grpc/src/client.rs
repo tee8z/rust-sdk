@@ -80,8 +80,27 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::RwLock;
+
+/// Process-wide number of GetVtxos RPCs dispatched to Tonic's channel.
+/// Includes SDK-internal lookups and every retry, across all client instances.
+/// A dispatch is an attempt, not proof that the remote server received it.
+static VTXO_REQUESTS_STARTED: AtomicU64 = AtomicU64::new(0);
+
+pub fn vtxo_requests_started() -> u64 {
+    VTXO_REQUESTS_STARTED.load(Ordering::Relaxed)
+}
+
+fn is_vtxo_request(req: &tonic::Request<()>) -> bool {
+    req.extensions()
+        .get::<tonic::GrpcMethod<'static>>()
+        .is_some_and(|method| {
+            method.service() == "ark.v1.IndexerService" && method.method() == "GetVtxos"
+        })
+}
 
 #[derive(Clone, Default)]
 struct HeaderState {
@@ -118,6 +137,11 @@ struct HeaderInterceptor {
 
 impl tonic::service::Interceptor for HeaderInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if is_vtxo_request(&req) {
+            let sequence = VTXO_REQUESTS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+            // No scripts, outpoints, credentials, or request bodies enter the log.
+            log::info!(target: "ark_indexer", "ark_indexer_request protocol=grpc method=GetVtxos sequence={sequence}");
+        }
         let metadata = req.metadata_mut();
         metadata.insert(
             "x-build-version",
@@ -140,6 +164,36 @@ impl tonic::service::Interceptor for HeaderInterceptor {
 
 type InterceptedChannel =
     tonic::codegen::InterceptedService<tonic::transport::Channel, HeaderInterceptor>;
+
+#[cfg(test)]
+mod request_accounting_tests {
+    use super::*;
+    use tonic::service::Interceptor;
+
+    #[test]
+    fn only_dispatched_get_vtxos_calls_are_counted_including_repeated_calls() {
+        let before = vtxo_requests_started();
+        let mut interceptor = HeaderInterceptor::default();
+        for method in ["GetInfo", "GetSubscription", "GetVtxoTree"] {
+            let mut request = tonic::Request::new(());
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new("ark.v1.IndexerService", method));
+            assert!(!is_vtxo_request(&request));
+            interceptor.call(request).expect("valid request metadata");
+        }
+        assert_eq!(vtxo_requests_started(), before);
+        for _ in 0..3 {
+            let mut request = tonic::Request::new(());
+            request
+                .extensions_mut()
+                .insert(tonic::GrpcMethod::new("ark.v1.IndexerService", "GetVtxos"));
+            assert!(is_vtxo_request(&request));
+            interceptor.call(request).expect("valid request metadata");
+        }
+        assert_eq!(vtxo_requests_started(), before + 3);
+    }
+}
 
 type InfoRefreshHook =
     Arc<dyn Fn(Info) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> + Send + Sync>;
@@ -300,6 +354,7 @@ impl Client {
 
     /// List VTXOs with pagination support.
     /// Returns a single page of results along with pagination info.
+    /// Waiting for the shared budget and reading the page share a 20-second deadline.
     pub async fn list_vtxos(&self, request: GetVtxosRequest) -> Result<ListVtxosResponse, Error> {
         if request.reference().is_empty() {
             return Ok(ListVtxosResponse {
@@ -308,8 +363,22 @@ impl Client {
             });
         }
 
-        let response = self
-            .indexer()?
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.list_vtxos_page(request),
+        )
+        .await
+        .map_err(|_| {
+            Error::request(tonic::Status::deadline_exceeded(
+                "GetVtxos exceeded its 20s budget, including rate-limit wait",
+            ))
+        })?
+    }
+
+    async fn list_vtxos_page(&self, request: GetVtxosRequest) -> Result<ListVtxosResponse, Error> {
+        let indexer = self.indexer()?;
+        let permit = crate::vtxo_request_permit(&self.url).await;
+        let response = indexer
             .request(move |mut client| async move {
                 client
                     .get_vtxos(generated::ark::v1::GetVtxosRequest::from(request))
@@ -331,6 +400,7 @@ impl Client {
             .transpose()
             .map_err(Error::conversion)?;
 
+        permit.succeeded();
         Ok(ListVtxosResponse { vtxos, page })
     }
 

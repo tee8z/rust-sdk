@@ -12,9 +12,12 @@ pub mod client;
 
 mod error;
 mod types;
+mod vtxo_limiter;
 
 pub use client::*;
 pub use error::Error;
+pub use vtxo_limiter::vtxo_request_permit;
+pub use vtxo_limiter::VtxoRequestPermit;
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;

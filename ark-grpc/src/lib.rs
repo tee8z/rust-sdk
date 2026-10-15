@@ -16,7 +16,9 @@ mod vtxo_limiter;
 
 pub use client::*;
 pub use error::Error;
+pub use vtxo_limiter::http_status_backs_off;
 pub use vtxo_limiter::set_vtxo_request_budget;
+pub use vtxo_limiter::status_backs_off;
 pub use vtxo_limiter::vtxo_request_permit;
 pub use vtxo_limiter::with_vtxo_request_priority;
 pub use vtxo_limiter::VtxoBudgetError;

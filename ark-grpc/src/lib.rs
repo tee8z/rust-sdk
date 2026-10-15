@@ -16,7 +16,10 @@ mod vtxo_limiter;
 
 pub use client::*;
 pub use error::Error;
+pub use vtxo_limiter::set_vtxo_request_budget;
 pub use vtxo_limiter::vtxo_request_permit;
+pub use vtxo_limiter::VtxoBudgetError;
+pub use vtxo_limiter::VtxoRequestBudget;
 pub use vtxo_limiter::VtxoRequestPermit;
 
 #[cfg(feature = "test-utils")]

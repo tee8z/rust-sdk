@@ -3,6 +3,8 @@
 
 use rand::Rng;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -16,6 +18,7 @@ const SPACING: Duration = Duration::from_secs(2);
 struct State {
     next: Instant,
     failures: u32,
+    budget: Option<Arc<dyn VtxoRequestBudget>>,
 }
 
 impl Default for State {
@@ -23,12 +26,49 @@ impl Default for State {
         Self {
             next: Instant::now(),
             failures: 0,
+            budget: None,
         }
     }
 }
 
 type Limiter = Arc<AsyncMutex<State>>;
 static LIMITERS: OnceLock<Mutex<HashMap<String, Limiter>>> = OnceLock::new();
+
+/// A shared, external budget. Reserve durably before returning success. A failed
+/// or cancelled reservation must never cause a request to the indexer.
+pub trait VtxoRequestBudget: Send + Sync {
+    fn reserve(&self) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>>;
+}
+
+#[derive(Debug)]
+pub struct VtxoBudgetError {
+    pub retry_after: Duration,
+    pub message: String,
+}
+
+impl std::fmt::Display for VtxoBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for VtxoBudgetError {}
+
+fn limiter(endpoint: &str) -> Limiter {
+    LIMITERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(endpoint.trim_end_matches('/').to_ascii_lowercase())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(State::default())))
+        .clone()
+}
+
+/// Install a budget before starting callers. Existing and new clients for this
+/// endpoint share it. Unavailable budgets fail closed; there is no local fallback.
+pub async fn set_vtxo_request_budget(endpoint: &str, budget: Arc<dyn VtxoRequestBudget>) {
+    limiter(endpoint).lock().await.budget = Some(budget);
+}
 
 /// Reserve a GetVtxos attempt, including REST requests for the same endpoint.
 ///
@@ -38,20 +78,20 @@ static LIMITERS: OnceLock<Mutex<HashMap<String, Limiter>>> = OnceLock::new();
 /// and does not dispatch or count a request. Keep this permit until the response
 /// is decoded, then call `succeeded`. Dropping it otherwise records a failure.
 ///
-/// The budget is per process. Separate processes and hosts need their own budgets.
-pub async fn vtxo_request_permit(endpoint: &str) -> VtxoRequestPermit {
+/// Pacing is per process. Install [`set_vtxo_request_budget`] before starting
+/// callers to enforce an additional durable budget shared across processes.
+pub async fn vtxo_request_permit(endpoint: &str) -> Result<VtxoRequestPermit, VtxoBudgetError> {
     // Retain strong references: constructing a fresh client must not reset pacing.
-    let limiter = {
-        let mut limiters = LIMITERS
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        limiters
-            .entry(endpoint.trim_end_matches('/').to_ascii_lowercase())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(State::default())))
-            .clone()
-    };
-    acquire(limiter).await
+    let mut permit = acquire(limiter(endpoint)).await;
+    if let Some(budget) = permit.state.budget.clone() {
+        if let Err(error) = budget.reserve().await {
+            // This is a local quota decision, not a failed indexer request.
+            permit.state.next = Instant::now() + error.retry_after;
+            permit.reserved = false;
+            return Err(error);
+        }
+    }
+    Ok(permit)
 }
 
 async fn acquire(limiter: Limiter) -> VtxoRequestPermit {
@@ -60,6 +100,7 @@ async fn acquire(limiter: Limiter) -> VtxoRequestPermit {
     VtxoRequestPermit {
         state,
         success: false,
+        reserved: true,
     }
 }
 
@@ -67,6 +108,7 @@ async fn acquire(limiter: Limiter) -> VtxoRequestPermit {
 pub struct VtxoRequestPermit {
     state: OwnedMutexGuard<State>,
     success: bool,
+    reserved: bool,
 }
 
 impl VtxoRequestPermit {
@@ -77,6 +119,9 @@ impl VtxoRequestPermit {
 
 impl Drop for VtxoRequestPermit {
     fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
         let delay = if self.success {
             self.state.failures = 0;
             SPACING
@@ -94,6 +139,49 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+
+    struct DeniedBudget(AtomicUsize);
+
+    impl VtxoRequestBudget for DeniedBudget {
+        fn reserve(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>> {
+            Box::pin(async {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(VtxoBudgetError {
+                    retry_after: Duration::from_secs(240),
+                    message: "shared quota exhausted".into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_budget_denial_blocks_new_clients_and_cannot_be_bypassed_by_a_burst() {
+        let endpoint = "https://shared-budget.test";
+        let budget = Arc::new(DeniedBudget(AtomicUsize::new(0)));
+        set_vtxo_request_budget(endpoint, budget.clone()).await;
+        let result = vtxo_request_permit(endpoint).await;
+        assert!(result.is_err());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            tasks.spawn(async {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    vtxo_request_permit("https://shared-budget.test/"),
+                )
+                .await
+                .is_err()
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap());
+        }
+        assert_eq!(budget.0.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(220)).await;
+        assert!(vtxo_request_permit(endpoint).await.is_err());
+        assert_eq!(budget.0.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_hundred_concurrent_callers_are_serial_and_spaced_even_on_success() {
@@ -186,7 +274,7 @@ mod tests {
         let endpoint = "http://cancelled-request.test";
         let (started, received) = tokio::sync::oneshot::channel();
         let request = tokio::spawn(async move {
-            let _permit = vtxo_request_permit(endpoint).await;
+            let _permit = vtxo_request_permit(endpoint).await.unwrap();
             started.send(()).expect("test receiver must remain open");
             std::future::pending::<()>().await;
         });
@@ -200,6 +288,7 @@ mod tests {
         // A new caller, including REST with a trailing slash, shares the state.
         vtxo_request_permit("http://cancelled-request.test/")
             .await
+            .unwrap()
             .succeeded();
         assert!((Duration::from_secs(10)..=Duration::from_secs(20))
             .contains(&(Instant::now() - completed)));

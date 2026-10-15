@@ -377,7 +377,9 @@ impl Client {
 
     async fn list_vtxos_page(&self, request: GetVtxosRequest) -> Result<ListVtxosResponse, Error> {
         let indexer = self.indexer()?;
-        let permit = crate::vtxo_request_permit(&self.url).await;
+        let permit = crate::vtxo_request_permit(&self.url)
+            .await
+            .map_err(Error::request)?;
         let response = indexer
             .request(move |mut client| async move {
                 client

@@ -79,6 +79,26 @@ impl Error {
         false
     }
 
+    /// Returns `true` if the server answered, if only to refuse this request,
+    /// rather than failing in a way that means callers should back off.
+    pub(crate) fn server_answered(&self) -> bool {
+        match self.inner.kind {
+            // The digest check failed and `/info` answered since.
+            Kind::ServerInfoChanged => true,
+            Kind::Request => self
+                .inner
+                .source
+                .as_ref()
+                .and_then(|source| source.downcast_ref::<tonic::Status>())
+                .is_some_and(|status| !crate::vtxo_limiter::status_backs_off(status.code())),
+            Kind::Connect
+            | Kind::NotConnected
+            | Kind::Conversion
+            | Kind::EventStreamDisconnect
+            | Kind::EventStream => false,
+        }
+    }
+
     /// Returns `true` if the server rejected the request because the cached
     /// `/info` digest is stale.
     pub(crate) fn is_digest_mismatch(&self) -> bool {
@@ -195,5 +215,35 @@ mod tests {
         let status = tonic::Status::failed_precondition("something else");
         let err = Error::request(status);
         assert!(!err.is_digest_mismatch());
+    }
+
+    #[test]
+    fn server_answered_only_for_refusals_of_the_request() {
+        for status in [
+            tonic::Status::invalid_argument("bad outpoint"),
+            tonic::Status::not_found("no such script"),
+            tonic::Status::failed_precondition("BUILD_VERSION_TOO_OLD"),
+        ] {
+            assert!(Error::request(status).server_answered());
+        }
+        assert!(
+            Error::server_info_changed(Error::request(tonic::Status::failed_precondition(
+                "DIGEST_MISMATCH"
+            )))
+            .server_answered()
+        );
+        for status in [
+            tonic::Status::unavailable("transport error"),
+            tonic::Status::deadline_exceeded("GetVtxos exceeded its 20s budget"),
+            tonic::Status::resource_exhausted("slow down"),
+            tonic::Status::internal("panic"),
+            tonic::Status::permission_denied("blocked"),
+        ] {
+            assert!(!Error::request(status).server_answered());
+        }
+        assert!(!Error::request("some string error").server_answered());
+        assert!(!Error::connect("refused").server_answered());
+        assert!(!Error::conversion("missing VTXO outpoint").server_answered());
+        assert!(!Error::not_connected().server_answered());
     }
 }

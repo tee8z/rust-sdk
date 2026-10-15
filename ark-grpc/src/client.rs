@@ -384,9 +384,20 @@ impl Client {
                     .get_vtxos(generated::ark::v1::GetVtxosRequest::from(request))
                     .await
             })
-            .await?;
+            .await;
+        // A refusal of this request, or a page that fails to decode below, is still
+        // an answer: only trouble at the server, or a refusal of us, backs off.
+        let answered = match &response {
+            Ok(_) => true,
+            Err(error) => error.server_answered(),
+        };
+        if answered {
+            permit.succeeded();
+        } else {
+            drop(permit);
+        }
 
-        let inner = response.into_inner();
+        let inner = response?.into_inner();
 
         let vtxos = inner
             .vtxos
@@ -400,7 +411,6 @@ impl Client {
             .transpose()
             .map_err(Error::conversion)?;
 
-        permit.succeeded();
         Ok(ListVtxosResponse { vtxos, page })
     }
 

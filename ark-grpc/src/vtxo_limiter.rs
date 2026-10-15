@@ -33,10 +33,12 @@ static LIMITERS: OnceLock<Mutex<HashMap<String, Limiter>>> = OnceLock::new();
 /// Reserve a GetVtxos attempt, including REST requests for the same endpoint.
 ///
 /// Clients sharing an endpoint share one in-flight request and a two-second
-/// gap after completion. Errors and cancelled in-flight requests back off with
+/// gap after completion. Failures and cancelled in-flight requests back off with
 /// equal jitter: 10–20 seconds, doubling to 150–300 seconds. Waiting is cancellable
-/// and does not dispatch or count a request. Keep this permit until the response
-/// is decoded, then call `succeeded`. Dropping it otherwise records a failure.
+/// and does not dispatch or count a request. Keep this permit until the server
+/// answers, then call `succeeded`, also for an answer that only refuses this
+/// request (`status_backs_off`, `http_status_backs_off`) or that cannot be decoded.
+/// Dropping it otherwise records a failure.
 ///
 /// The budget is per process. Separate processes and hosts need their own budgets.
 pub async fn vtxo_request_permit(endpoint: &str) -> VtxoRequestPermit {
@@ -63,7 +65,31 @@ async fn acquire(limiter: Limiter) -> VtxoRequestPermit {
     }
 }
 
-/// Holds the shared budget through dispatch, response, and decoding.
+/// Whether a GetVtxos status means every caller should back off: the server may
+/// be struggling, or it refuses us. A status that only says this request was wrong
+/// is an answer, and the next request waits the usual spacing.
+pub fn status_backs_off(code: tonic::Code) -> bool {
+    !matches!(
+        code,
+        tonic::Code::InvalidArgument
+            | tonic::Code::NotFound
+            | tonic::Code::AlreadyExists
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::OutOfRange
+    )
+}
+
+/// `status_backs_off` for an HTTP status from the REST indexer.
+pub fn http_status_backs_off(status: u16) -> bool {
+    match status {
+        200..=299 => false,
+        401 | 403 | 408 | 429 => true,
+        400..=499 => false,
+        _ => true,
+    }
+}
+
+/// Holds the shared budget through dispatch and response.
 pub struct VtxoRequestPermit {
     state: OwnedMutexGuard<State>,
     success: bool,
@@ -203,5 +229,40 @@ mod tests {
             .succeeded();
         assert!((Duration::from_secs(10)..=Duration::from_secs(20))
             .contains(&(Instant::now() - completed)));
+    }
+
+    #[test]
+    fn only_trouble_at_the_server_or_a_refusal_of_us_backs_off() {
+        use tonic::Code;
+        for code in [
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::FailedPrecondition,
+            Code::OutOfRange,
+        ] {
+            assert!(!status_backs_off(code), "{code:?}");
+        }
+        for code in [
+            Code::Unknown,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::Unavailable,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ] {
+            assert!(status_backs_off(code), "{code:?}");
+        }
+        for status in [200, 204, 400, 404, 409, 414, 422] {
+            assert!(!http_status_backs_off(status), "{status}");
+        }
+        for status in [302, 401, 403, 408, 429, 500, 502, 503, 504] {
+            assert!(http_status_backs_off(status), "{status}");
+        }
     }
 }

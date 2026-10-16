@@ -143,7 +143,9 @@ where
     {
         let server_info = self.server_info().await?;
 
-        let vtxo_list = self.list_vtxos_with_server_info(&server_info).await?;
+        let vtxo_list = self
+            .list_unspent_vtxos_with_server_info(&server_info)
+            .await?;
         let vtxo_outpoints: Vec<OutPoint> = vtxo_list
             .recoverable()
             .map(|entry| entry.vtxo().outpoint)
@@ -1202,7 +1204,10 @@ where
             }
         }
 
-        let vtxo_list = self.list_vtxos_with_server_info(server_info).await?;
+        // Only unspent VTXOs can enter a batch.
+        let vtxo_list = self
+            .list_unspent_vtxos_with_server_info(server_info)
+            .await?;
         // Reuse the caller-supplied timestamp (not a fresh wall-clock) so the VTXO cutoff filter
         // below is evaluated against the same instant as the boarding filter above, and so a
         // test-injected `now` deterministically controls both.

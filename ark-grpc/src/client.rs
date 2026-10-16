@@ -1665,6 +1665,33 @@ impl From<GetVtxosRequest> for generated::ark::v1::GetVtxosRequest {
     }
 }
 
+#[cfg(test)]
+mod get_vtxos_request_tests {
+    use super::*;
+
+    #[test]
+    fn renewable_only_asks_for_unspent_vtxos_alone() {
+        let request = || GetVtxosRequest::new_for_outpoints(&[OutPoint::null()]);
+        let generated =
+            generated::ark::v1::GetVtxosRequest::from(request().renewable_only().unwrap());
+        assert!(generated.renewable_only);
+        assert!(
+            !generated.spendable_only
+                && !generated.spent_only
+                && !generated.recoverable_only
+                && !generated.pending_only
+        );
+        assert!(request()
+            .spendable_only()
+            .unwrap()
+            .renewable_only()
+            .is_err());
+        let after = generated::ark::v1::GetVtxosRequest::from(request().with_after(1_800_000));
+        assert_eq!(after.after, 1_800_000);
+        assert!(!after.renewable_only && !after.spendable_only);
+    }
+}
+
 mod guarded {
     //! Guarded wrappers around the generated tonic clients.
     //!

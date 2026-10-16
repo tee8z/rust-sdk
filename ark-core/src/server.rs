@@ -317,6 +317,18 @@ impl GetVtxosRequest {
         })
     }
 
+    /// Only VTXOs that are neither spent nor unrolled: the spendable and the recoverable ones.
+    pub fn renewable_only(self) -> Result<Self, Error> {
+        if self.filter.is_some() {
+            return Err(Error::ad_hoc("GetVtxosRequest filter already set"));
+        }
+
+        Ok(Self {
+            filter: Some(GetVtxosRequestFilter::Renewable),
+            ..self
+        })
+    }
+
     pub fn reference(&self) -> &GetVtxosRequestReference {
         &self.reference
     }

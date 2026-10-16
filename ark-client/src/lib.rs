@@ -1742,6 +1742,23 @@ where
         Ok(AnnotatedVtxoList::new(server_info.dust, contract_vtxos))
     }
 
+    /// The VTXOs a batch can settle: neither spent nor unrolled. The indexer leaves out the spent
+    /// ones, most of a long-lived address's history, so this lists in a page or two where
+    /// `list_vtxos` reads every page the address has ever held.
+    pub(crate) async fn list_unspent_vtxos_with_server_info(
+        &self,
+        server_info: &server::Info,
+    ) -> Result<AnnotatedVtxoList, Error> {
+        let addresses = self.active_offchain_contract_addresses()?;
+        let request = GetVtxosRequest::new_for_addresses(addresses.into_iter())
+            .renewable_only()
+            .map_err(Error::from)?;
+        let virtual_tx_outpoints = self.fetch_all_vtxos(request).await?;
+        let contract_vtxos = self.annotate_vtxos(virtual_tx_outpoints)?;
+
+        Ok(AnnotatedVtxoList::new(server_info.dust, contract_vtxos))
+    }
+
     pub async fn list_vtxos_for_addresses(
         &self,
         addresses: impl Iterator<Item = ArkAddress>,

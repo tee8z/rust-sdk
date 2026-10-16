@@ -5,6 +5,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -19,6 +20,7 @@ struct State {
     next: Instant,
     failures: u32,
     budget: Option<Arc<dyn VtxoRequestBudget>>,
+    deferred: [Option<(Instant, VtxoBudgetError)>; 2],
 }
 
 impl Default for State {
@@ -27,20 +29,77 @@ impl Default for State {
             next: Instant::now(),
             failures: 0,
             budget: None,
+            deferred: [None, None],
         }
     }
 }
 
 type Limiter = Arc<AsyncMutex<State>>;
-static LIMITERS: OnceLock<Mutex<HashMap<String, Limiter>>> = OnceLock::new();
+#[derive(Clone)]
+struct Endpoint {
+    limiter: Limiter,
+    payments: Arc<AtomicUsize>,
+}
+static LIMITERS: OnceLock<Mutex<HashMap<String, Endpoint>>> = OnceLock::new();
+
+/// Unclassified reads are background work and cannot consume payment reserves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VtxoRequestPriority {
+    Payment,
+    #[default]
+    Background,
+}
+
+impl VtxoRequestPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Payment => "payment",
+            Self::Background => "background",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Payment => 0,
+            Self::Background => 1,
+        }
+    }
+}
+
+tokio::task_local! { static REQUEST_PRIORITY: VtxoRequestPriority; }
+
+/// Scope the priority to this future, including directly awaited SDK calls.
+/// Spawned tasks default to background and must be scoped explicitly if needed.
+pub async fn with_vtxo_request_priority<F: Future>(
+    priority: VtxoRequestPriority,
+    future: F,
+) -> F::Output {
+    REQUEST_PRIORITY.scope(priority, future).await
+}
+
+struct WaitingPayment(Arc<AtomicUsize>);
+impl WaitingPayment {
+    fn new(waiting: Arc<AtomicUsize>) -> Self {
+        waiting.fetch_add(1, Ordering::SeqCst);
+        Self(waiting)
+    }
+}
+impl Drop for WaitingPayment {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// A shared, external budget. Reserve durably before returning success. A failed
 /// or cancelled reservation must never cause a request to the indexer.
 pub trait VtxoRequestBudget: Send + Sync {
-    fn reserve(&self) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>>;
+    fn reserve(
+        &self,
+        priority: VtxoRequestPriority,
+    ) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VtxoBudgetError {
     pub retry_after: Duration,
     pub message: String,
@@ -54,20 +113,23 @@ impl std::fmt::Display for VtxoBudgetError {
 
 impl std::error::Error for VtxoBudgetError {}
 
-fn limiter(endpoint: &str) -> Limiter {
+fn limiter(endpoint: &str) -> Endpoint {
     LIMITERS
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(endpoint.trim_end_matches('/').to_ascii_lowercase())
-        .or_insert_with(|| Arc::new(AsyncMutex::new(State::default())))
+        .or_insert_with(|| Endpoint {
+            limiter: Arc::new(AsyncMutex::new(State::default())),
+            payments: Arc::default(),
+        })
         .clone()
 }
 
 /// Install a budget before starting callers. Existing and new clients for this
 /// endpoint share it. Unavailable budgets fail closed; there is no local fallback.
 pub async fn set_vtxo_request_budget(endpoint: &str, budget: Arc<dyn VtxoRequestBudget>) {
-    limiter(endpoint).lock().await.budget = Some(budget);
+    limiter(endpoint).limiter.lock().await.budget = Some(budget);
 }
 
 /// Reserve a GetVtxos attempt, including REST requests for the same endpoint.
@@ -82,18 +144,56 @@ pub async fn set_vtxo_request_budget(endpoint: &str, budget: Arc<dyn VtxoRequest
 /// callers to enforce an additional durable budget shared across processes.
 pub async fn vtxo_request_permit(endpoint: &str) -> Result<VtxoRequestPermit, VtxoBudgetError> {
     // Retain strong references: constructing a fresh client must not reset pacing.
-    let mut permit = acquire(limiter(endpoint)).await;
+    let endpoint = limiter(endpoint);
+    let priority = REQUEST_PRIORITY
+        .try_with(|priority| *priority)
+        .unwrap_or_default();
+    let _waiting = (priority == VtxoRequestPriority::Payment)
+        .then(|| WaitingPayment::new(endpoint.payments.clone()));
+    let state = endpoint.limiter.lock_owned().await;
+    let yield_to_payment = || {
+        if priority == VtxoRequestPriority::Background
+            && endpoint.payments.load(Ordering::SeqCst) > 0
+        {
+            Err(VtxoBudgetError {
+                retry_after: Duration::from_secs(1),
+                message: "background GetVtxos read deferred for a waiting payment".into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+    yield_to_payment()?;
+    if let Some((until, error)) = &state.deferred[priority.index()] {
+        if *until > Instant::now() {
+            return Err(VtxoBudgetError {
+                retry_after: until.saturating_duration_since(Instant::now()),
+                message: error.message.clone(),
+            });
+        }
+    }
+    tokio::time::sleep_until(state.next).await;
+    yield_to_payment()?;
+    let mut permit = VtxoRequestPermit {
+        state,
+        success: false,
+        reserved: true,
+    };
     if let Some(budget) = permit.state.budget.clone() {
-        if let Err(error) = budget.reserve().await {
-            // This is a local quota decision, not a failed indexer request.
-            permit.state.next = Instant::now() + error.retry_after;
+        if let Err(error) = budget.reserve(priority).await {
+            // Quota denials are cached per priority and return promptly. A
+            // background denial cannot block the reserved payment capacity.
+            permit.state.deferred[priority.index()] =
+                Some((Instant::now() + error.retry_after, error.clone()));
             permit.reserved = false;
             return Err(error);
         }
     }
+    permit.state.deferred[priority.index()] = None;
     Ok(permit)
 }
 
+#[cfg(test)]
 async fn acquire(limiter: Limiter) -> VtxoRequestPermit {
     let state = limiter.lock_owned().await;
     tokio::time::sleep_until(state.next).await;
@@ -140,11 +240,90 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    struct PaymentReserve;
+
+    impl VtxoRequestBudget for PaymentReserve {
+        fn reserve(
+            &self,
+            priority: VtxoRequestPriority,
+        ) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>> {
+            Box::pin(async move {
+                match priority {
+                    VtxoRequestPriority::Payment => Ok(()),
+                    VtxoRequestPriority::Background => Err(VtxoBudgetError {
+                        retry_after: Duration::from_secs(240),
+                        message: "capacity reserved for payments".into(),
+                    }),
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_denial_does_not_block_payment_or_leak_priority_to_other_tasks() {
+        let endpoint = "https://priority-reserve.test";
+        set_vtxo_request_budget(endpoint, Arc::new(PaymentReserve)).await;
+        assert!(vtxo_request_permit(endpoint).await.is_err());
+        let start = Instant::now();
+        with_vtxo_request_priority(VtxoRequestPriority::Payment, async {
+            vtxo_request_permit(endpoint).await.unwrap().succeeded();
+            assert!(tokio::spawn(async { vtxo_request_permit(endpoint).await })
+                .await
+                .unwrap()
+                .is_err());
+        })
+        .await;
+        assert_eq!(
+            Instant::now(),
+            start,
+            "payment must not wait for the background cooldown"
+        );
+        assert!(
+            vtxo_request_permit(endpoint).await.is_err(),
+            "priority ends with the scoped future"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_payments_pass_queued_background_work_and_cancellation_releases_priority() {
+        let endpoint = "https://priority-queue.test";
+        let held = vtxo_request_permit(endpoint).await.unwrap();
+        let background = tokio::spawn(async { vtxo_request_permit(endpoint).await });
+        tokio::task::yield_now().await;
+        let payment = tokio::spawn(with_vtxo_request_priority(
+            VtxoRequestPriority::Payment,
+            async {
+                vtxo_request_permit(endpoint).await.unwrap().succeeded();
+            },
+        ));
+        tokio::task::yield_now().await;
+        held.succeeded();
+        assert!(
+            background.await.unwrap().is_err(),
+            "queued background work must yield"
+        );
+        payment.await.unwrap();
+
+        let held = vtxo_request_permit(endpoint).await.unwrap();
+        let cancelled = tokio::spawn(with_vtxo_request_priority(
+            VtxoRequestPriority::Payment,
+            async {
+                vtxo_request_permit(endpoint).await.unwrap().succeeded();
+            },
+        ));
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        held.succeeded();
+        vtxo_request_permit(endpoint).await.unwrap().succeeded();
+    }
+
     struct DeniedBudget(AtomicUsize);
 
     impl VtxoRequestBudget for DeniedBudget {
         fn reserve(
             &self,
+            _priority: VtxoRequestPriority,
         ) -> Pin<Box<dyn Future<Output = Result<(), VtxoBudgetError>> + Send + '_>> {
             Box::pin(async {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -171,6 +350,7 @@ mod tests {
                     vtxo_request_permit("https://shared-budget.test/"),
                 )
                 .await
+                .expect("a cached denial returns immediately")
                 .is_err()
             });
         }
@@ -178,7 +358,7 @@ mod tests {
             assert!(result.unwrap());
         }
         assert_eq!(budget.0.load(Ordering::SeqCst), 1);
-        tokio::time::advance(Duration::from_secs(220)).await;
+        tokio::time::advance(Duration::from_secs(240)).await;
         assert!(vtxo_request_permit(endpoint).await.is_err());
         assert_eq!(budget.0.load(Ordering::SeqCst), 2);
     }

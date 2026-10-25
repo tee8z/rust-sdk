@@ -1038,6 +1038,12 @@ where
             .map_err(Error::ad_hoc)
     }
 
+    fn eval_offchain_output_fee(&self, output: ark_fees::Output) -> Result<Amount, Error> {
+        self.with_server_state(|state| state.fee_estimator.eval_offchain_output(output))?
+            .map(|fee| Amount::from_sat(fee.to_satoshis()))
+            .map_err(Error::ad_hoc)
+    }
+
     /// Force-fetch the latest Ark server `/info` and replace the cached server state.
     ///
     /// This bypasses the TTL used by [`Self::server_info`]. Concurrent refreshes are serialized

@@ -281,8 +281,8 @@ where
         // Get off-chain address and send all funds to this address, no change output.
         let (to_address, _) = self.get_offchain_address_with_server_info(server_info)?;
 
-        let (all_boarding_inputs, all_vtxo_inputs, _) = self
-            .fetch_commitment_transaction_inputs(server_info, crate::utils::unix_now()?)
+        let (all_boarding_inputs, all_vtxo_inputs, _, input_fees) = self
+            .fetch_commitment_transaction_inputs_with_fees(server_info, crate::utils::unix_now()?)
             .await?;
 
         // Filter boarding inputs to only those specified.
@@ -317,6 +317,28 @@ where
             return Ok(None);
         }
 
+        // The server charges an intent fee per input and output under its fee programs, and
+        // refuses an intent that pays less (INTENT_INSUFFICIENT_FEE). The settled output pays it.
+        let output_fee = self.eval_offchain_output_fee(ark_fees::Output {
+            amount: total_amount.to_sat(),
+            script: to_address.to_p2tr_script_pubkey().to_hex_string(),
+        })?;
+        let intent_fee = boarding_inputs
+            .iter()
+            .map(|input| input.outpoint())
+            .chain(vtxo_inputs.iter().map(|input| input.outpoint()))
+            .filter_map(|outpoint| input_fees.get(&outpoint).copied())
+            .fold(output_fee, |acc, fee| acc + fee);
+        let to_amount = total_amount
+            .checked_sub(intent_fee)
+            .filter(|amount| *amount >= server_info.dust)
+            .ok_or_else(|| {
+                Error::coin_select(format!(
+                    "the inputs ({total_amount}) cannot pay the batch's intent fee ({intent_fee})"
+                ))
+            })?;
+        tracing::debug!(%total_amount, %intent_fee, %to_amount, "Settling with the intent fee");
+
         let join_next_batch = || async {
             self.join_next_batch(
                 &mut rng.clone(),
@@ -325,7 +347,7 @@ where
                 vtxo_inputs.clone(),
                 BatchOutputType::Board {
                     to_address,
-                    to_amount: total_amount,
+                    to_amount,
                 },
             )
             .await
@@ -1132,6 +1154,27 @@ where
         server_info: &server::Info,
         now: i64,
     ) -> Result<(Vec<batch::OnChainInput>, Vec<intent::Input>, Amount), Error> {
+        let (boarding_inputs, vtxo_inputs, total_amount, _) = self
+            .fetch_commitment_transaction_inputs_with_fees(server_info, now)
+            .await?;
+        Ok((boarding_inputs, vtxo_inputs, total_amount))
+    }
+
+    /// [`Self::fetch_commitment_transaction_inputs`], with the intent fee the server charges for
+    /// each input under its current fee programs, by outpoint.
+    pub(crate) async fn fetch_commitment_transaction_inputs_with_fees(
+        &self,
+        server_info: &server::Info,
+        now: i64,
+    ) -> Result<
+        (
+            Vec<batch::OnChainInput>,
+            Vec<intent::Input>,
+            Amount,
+            HashMap<OutPoint, Amount>,
+        ),
+        Error,
+    > {
         let now = u64::try_from(now).map_err(|_| Error::ad_hoc("negative timestamp"))?;
 
         // Get all known boarding outputs.
@@ -1219,6 +1262,15 @@ where
             .iter()
             .fold(Amount::ZERO, |acc, entry| acc + entry.vtxo().amount);
 
+        let fees = self.with_server_state(|state| {
+            intent_input_fees(
+                &state.fee_estimator,
+                &boarding_inputs,
+                settleable_vtxos.iter().map(|entry| entry.vtxo()),
+                server_info.dust,
+            )
+        })??;
+
         let vtxo_inputs = settleable_vtxos
             .into_iter()
             .map(|entry| {
@@ -1240,7 +1292,7 @@ where
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        Ok((boarding_inputs, vtxo_inputs, total_amount))
+        Ok((boarding_inputs, vtxo_inputs, total_amount, fees))
     }
 
     /// Prepare an intent for batch registration or fee estimation.
@@ -2025,6 +2077,43 @@ pub(crate) struct PreparedIntent {
     pub vtxo_inputs: Vec<intent::Input>,
 }
 
+/// The intent fee the server's fee programs charge each input, by outpoint. Each fee rounds up
+/// on its own, so their sum is never below the server's however it rounds the total.
+pub(crate) fn intent_input_fees<'a>(
+    estimator: &ark_fees::Estimator,
+    boarding: impl IntoIterator<Item = &'a batch::OnChainInput>,
+    vtxos: impl IntoIterator<Item = &'a server::VirtualTxOutPoint>,
+    dust: Amount,
+) -> Result<HashMap<OutPoint, Amount>, Error> {
+    let mut fees = HashMap::new();
+    for input in boarding {
+        let fee = estimator
+            .eval_onchain_input(ark_fees::OnchainInput {
+                amount: input.amount().to_sat(),
+            })
+            .map_err(Error::ad_hoc)?;
+        fees.insert(input.outpoint(), Amount::from_sat(fee.to_satoshis()));
+    }
+    for vtxo in vtxos {
+        let input_type = if vtxo.is_recoverable(dust) {
+            ark_fees::VtxoType::Recoverable
+        } else {
+            ark_fees::VtxoType::Vtxo
+        };
+        let fee = estimator
+            .eval_offchain_input(ark_fees::OffchainInput {
+                amount: vtxo.amount.to_sat(),
+                expiry: Some(vtxo.expires_at),
+                birth: Some(vtxo.created_at),
+                input_type,
+                weight: 0.0,
+            })
+            .map_err(Error::ad_hoc)?;
+        fees.insert(vtxo.outpoint, Amount::from_sat(fee.to_satoshis()));
+    }
+    Ok(fees)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2038,5 +2127,58 @@ mod tests {
 
         assert!(!is_other_batch(&joined, "e33952d6"));
         assert!(is_other_batch(&joined, "b16f6512"));
+    }
+
+    fn vtxo(byte: u8, sats: u64, age_secs: i64, swept: bool) -> server::VirtualTxOutPoint {
+        let now = crate::utils::unix_now().unwrap();
+        server::VirtualTxOutPoint {
+            outpoint: OutPoint::new(Txid::from_byte_array([byte; 32]), 0),
+            created_at: now - age_secs,
+            expires_at: now + 7 * 86_400,
+            amount: Amount::from_sat(sats),
+            script: bitcoin::ScriptBuf::new(),
+            is_preconfirmed: true,
+            is_swept: swept,
+            is_unrolled: false,
+            is_spent: false,
+            spent_by: None,
+            commitment_txids: Vec::new(),
+            settled_by: None,
+            ark_txid: None,
+            assets: Vec::new(),
+            depth: 1,
+        }
+    }
+
+    #[test]
+    fn intent_fees_charge_young_vtxos_and_round_up_per_input() {
+        // The fee program Arkade's Mutinynet server has run since 2026-10-21.
+        let estimator = ark_fees::Estimator::new(ark_fees::Config {
+            intent_offchain_input_program:
+                "inputType == 'vtxo' && now() - birth < 86400.0 ? amount * 0.002 : 0.0".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let dust = Amount::from_sat(330);
+
+        // Twenty escrows of 5,382 sats funded within the day: the server asked for 216.
+        let escrows: Vec<_> = (0..20).map(|i| vtxo(i, 5_382, 3_600, false)).collect();
+        let fees = intent_input_fees(&estimator, std::iter::empty(), escrows.iter(), dust).unwrap();
+        let total: Amount = fees.values().copied().sum();
+        assert_eq!(total, Amount::from_sat(220));
+        assert!(total >= Amount::from_sat(216));
+
+        let old = vtxo(30, 100_000, 2 * 86_400, false);
+        let swept = vtxo(31, 100_000, 3_600, true);
+        let young = vtxo(32, 100_000, 3_600, false);
+        let fees = intent_input_fees(&estimator, std::iter::empty(), [&old, &swept, &young], dust)
+            .unwrap();
+        assert_eq!(fees[&old.outpoint], Amount::ZERO);
+        assert_eq!(
+            fees[&swept.outpoint],
+            Amount::ZERO,
+            "recoverable inputs pay no young fee"
+        );
+        assert_eq!(fees[&young.outpoint], Amount::from_sat(200));
     }
 }
